@@ -12,4 +12,6 @@ pip install opencv-python numpy gradio
 ## Running
 To run basic transformation, run:
 zuoye11
+
 To run point guided transformation, run:
+zuoye12
