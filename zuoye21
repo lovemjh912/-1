@@ -1,0 +1,246 @@
+import gradio as gr
+from PIL import ImageDraw
+import numpy as np
+import cv2
+
+import torch
+import torch.nn.functional as F
+
+
+# Initialize the polygon state
+def initialize_polygon():
+    """
+    Initializes the polygon state.
+    """
+    return {'points': [], 'closed': False}
+
+
+# Add a point to the polygon when the user clicks on the image
+def add_point(img_original, polygon_state, evt: gr.SelectData):
+    """
+    Adds a point to the polygon based on user click event.
+    """
+    if polygon_state['closed']:
+        return img_original, polygon_state
+
+    x, y = evt.index
+    polygon_state['points'].append((x, y))
+
+    img_with_poly = img_original.copy()
+    draw = ImageDraw.Draw(img_with_poly)
+
+    if len(polygon_state['points']) > 1:
+        draw.line(polygon_state['points'], fill='red', width=2)
+
+    for point in polygon_state['points']:
+        draw.ellipse((point[0] - 3, point[1] - 3, point[0] + 3, point[1] + 3), fill='blue')
+
+    return img_with_poly, polygon_state
+
+
+# Close the polygon when the user clicks the "Close Polygon" button
+def close_polygon(img_original, polygon_state):
+    """
+    Closes the polygon if there are at least three points.
+    """
+    if not polygon_state['closed'] and len(polygon_state['points']) > 2:
+        polygon_state['closed'] = True
+        img_with_poly = img_original.copy()
+        draw = ImageDraw.Draw(img_with_poly)
+        draw.polygon(polygon_state['points'], outline='red')
+        return img_with_poly, polygon_state
+    else:
+        return img_original, polygon_state
+
+
+# Update the background image by drawing the shifted polygon on it
+def update_background(background_image_original, polygon_state, dx, dy):
+    """
+    Updates the background image by drawing the shifted polygon on it.
+    """
+    if background_image_original is None:
+        return None
+
+    if polygon_state['closed']:
+        img_with_poly = background_image_original.copy()
+        draw = ImageDraw.Draw(img_with_poly)
+        shifted_points = [(x + dx, y + dy) for x, y in polygon_state['points']]
+        draw.polygon(shifted_points, outline='red')
+        return img_with_poly
+    else:
+        return background_image_original
+
+
+def close_polygon_and_reset_dx(img_original, polygon_state, dx, dy, background_image_original):
+    img_with_poly, updated_polygon_state = close_polygon(img_original, polygon_state)
+    new_dx = gr.update(value=0)
+    updated_background = update_background(background_image_original, updated_polygon_state, 0, dy)
+    return img_with_poly, updated_polygon_state, updated_background, new_dx
+
+
+def create_mask_from_points(points, height, width):
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if points is not None and len(points) > 2:
+        pts = np.array(points, np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+
+def cal_laplacian_loss(fg_img_tensor, fg_mask_tensor, blended_img_for_loss, bg_mask_tensor):
+    kernel = torch.tensor([[[[0.0, -1.0, 0.0],
+                             [-1.0, 4.0, -1.0],
+                             [0.0, -1.0, 0.0]]]], device=fg_img_tensor.device)
+    kernel = kernel.repeat(3, 1, 1, 1)
+
+    fg_laplacian = F.conv2d(fg_img_tensor, kernel, groups=3, padding=1)
+    blended_laplacian = F.conv2d(blended_img_for_loss, kernel, groups=3, padding=1)
+
+    # 【终极修复：恢复布尔提取逻辑】：提取多边形内部的有效像素，变成 1D 向量
+    # 彻底解决前景图和背景图尺寸不一致带来的相乘报错
+    fg_mask_bool = fg_mask_tensor.expand(-1, 3, -1, -1) > 0.5
+    bg_mask_bool = bg_mask_tensor.expand(-1, 3, -1, -1) > 0.5
+
+    fg_lap_masked = fg_laplacian[fg_mask_bool]
+    blend_lap_masked = blended_laplacian[bg_mask_bool]
+
+    # 防呆保护：如果拖动使得多边形越出背景边界，两边像素数量会不一致，取最小值对齐
+    min_len = min(fg_lap_masked.shape[0], blend_lap_masked.shape[0])
+
+    loss = F.mse_loss(blend_lap_masked[:min_len], fg_lap_masked[:min_len])
+    return loss
+
+
+def blending(foreground_image_original, background_image_original, dx, dy, polygon_state):
+    if not polygon_state['closed'] or background_image_original is None or foreground_image_original is None:
+        return background_image_original
+
+    foreground_np = np.array(foreground_image_original)
+    background_np = np.array(background_image_original)
+
+    foreground_polygon_points = np.array(polygon_state['points']).astype(np.int64)
+    background_polygon_points = foreground_polygon_points + np.array([int(dx), int(dy)]).reshape(1, 2)
+
+    foreground_mask = create_mask_from_points(foreground_polygon_points, foreground_np.shape[0], foreground_np.shape[1])
+    background_mask = create_mask_from_points(background_polygon_points, background_np.shape[0], background_np.shape[1])
+
+    if torch.cuda.is_available():
+        device = 'cuda:0'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
+
+    fg_img_tensor = torch.from_numpy(foreground_np).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.
+    bg_img_tensor = torch.from_numpy(background_np).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.
+    fg_mask_tensor = torch.from_numpy(foreground_mask).to(device).unsqueeze(0).unsqueeze(0).float() / 255.
+    bg_mask_tensor = torch.from_numpy(background_mask).to(device).unsqueeze(0).unsqueeze(0).float() / 255.
+
+    blended_img = bg_img_tensor.clone()
+
+    # 【安全赋值逻辑】：处理前背景不同尺寸的初始化覆盖
+    fg_mask_bool = fg_mask_tensor.expand(-1, 3, -1, -1) > 0.5
+    bg_mask_bool = bg_mask_tensor.expand(-1, 3, -1, -1) > 0.5
+
+    fg_pixels = fg_img_tensor[fg_mask_bool]
+
+    bg_shape = blended_img.shape
+    blended_flat = blended_img.flatten()
+    bg_indices = bg_mask_bool.flatten().nonzero(as_tuple=True)[0]
+
+    min_len = min(fg_pixels.shape[0], bg_indices.shape[0])
+    blended_flat[bg_indices[:min_len]] = fg_pixels[:min_len]
+
+    blended_img = blended_flat.view(bg_shape)
+    blended_img.requires_grad = True
+
+    optimizer = torch.optim.Adam([blended_img], lr=1e-2)
+
+    iter_num = 1000
+    for step in range(iter_num):
+        blended_img_for_loss = blended_img.detach() * (1. - bg_mask_tensor) + blended_img * bg_mask_tensor
+        loss = cal_laplacian_loss(fg_img_tensor, fg_mask_tensor, blended_img_for_loss, bg_mask_tensor)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if step % 50 == 0:
+            print(f'Optimize step: {step}, Laplacian distance loss: {loss.item()}')
+
+        if step == int(iter_num * 2 / 3):
+            optimizer.param_groups[0]['lr'] *= 0.1
+
+    result = torch.clamp(blended_img.detach(), 0, 1).cpu().permute(0, 2, 3, 1).squeeze().numpy() * 255
+    result = result.astype(np.uint8)
+    return result
+
+
+# Gradio Interface
+with gr.Blocks(title="Poisson Image Blending", css="""
+    body { background-color: #1e1e1e; color: #ffffff; }
+    .gr-button { font-size: 1em; padding: 0.75em 1.5em; border-radius: 8px; background-color: #6200ee; color: #ffffff; border: none; }
+    .gr-button:hover { background-color: #3700b3; }
+    .gr-slider input[type=range] { accent-color: #03dac6; }
+    .gr-text, .gr-markdown { font-size: 1.1em; }
+    .gr-markdown h1, .gr-markdown h2, .gr-markdown h3 { color: #bb86fc; }
+    .gr-input, .gr-output { background-color: #2c2c2c; border: 1px solid #3c3c3c; }
+""") as demo:
+    polygon_state = gr.State(initialize_polygon())
+    background_image_original = gr.State(value=None)
+
+    gr.Markdown("<h1 style='text-align: center;'>Poisson Image Blending</h1>")
+    gr.Markdown(
+        "<p style='text-align: center; font-size: 1.2em;'>Blend a selected area from a foreground image onto a background image with adjustable positions.</p>")
+
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("### Foreground Image")
+            foreground_image_original = gr.Image(label="", type="pil", interactive=True, height=300)
+            gr.Markdown(
+                "<p style='font-size: 0.9em;'>Upload the foreground image where the polygon will be selected.</p>")
+            gr.Markdown("### Foreground Image with Polygon")
+            foreground_image_with_polygon = gr.Image(label="", type="pil", interactive=True, height=300)
+            gr.Markdown(
+                "<p style='font-size: 0.9em;'>Click on the image to define the polygon area. After selecting at least three points, click <strong>Close Polygon</strong>.</p>")
+            close_polygon_button = gr.Button("Close Polygon")
+        with gr.Column():
+            gr.Markdown("### Background Image")
+            background_image = gr.Image(label="", type="pil", interactive=True, height=300)
+            gr.Markdown(
+                "<p style='font-size: 0.9em;'>Upload the background image where the polygon will be placed.</p>")
+
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("### Background Image with Polygon Overlay")
+            background_image_with_polygon = gr.Image(label="", type="pil", height=500)
+            gr.Markdown("<p style='font-size: 0.9em;'>Adjust the position of the polygon using the sliders below.</p>")
+        with gr.Column():
+            gr.Markdown("### Blended Image")
+            output_image = gr.Image(label="", type="pil", height=500)
+
+    with gr.Row():
+        with gr.Column():
+            dx = gr.Slider(label="Horizontal Offset", minimum=-500, maximum=500, step=1, value=0)
+        with gr.Column():
+            dy = gr.Slider(label="Vertical Offset", minimum=-500, maximum=500, step=1, value=0)
+        blend_button = gr.Button("Blend Images")
+
+    foreground_image_original.change(fn=lambda img: img, inputs=foreground_image_original,
+                                     outputs=foreground_image_with_polygon)
+    foreground_image_with_polygon.select(add_point, inputs=[foreground_image_original, polygon_state],
+                                         outputs=[foreground_image_with_polygon, polygon_state])
+    close_polygon_button.click(fn=close_polygon_and_reset_dx,
+                               inputs=[foreground_image_original, polygon_state, dx, dy, background_image_original],
+                               outputs=[foreground_image_with_polygon, polygon_state, background_image_with_polygon,
+                                        dx])
+    background_image.change(fn=lambda img: img, inputs=background_image, outputs=background_image_original)
+    dx.change(fn=update_background, inputs=[background_image_original, polygon_state, dx, dy],
+              outputs=background_image_with_polygon)
+    dy.change(fn=update_background, inputs=[background_image_original, polygon_state, dx, dy],
+              outputs=background_image_with_polygon)
+    blend_button.click(fn=blending,
+                       inputs=[foreground_image_original, background_image_original, dx, dy, polygon_state],
+                       outputs=output_image)
+
+if __name__ == "__main__":
+    demo.launch()
