@@ -1,0 +1,131 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+
+# ==========================================
+# 核心函数：纯 PyTorch 手写欧拉角转旋转矩阵
+# ==========================================
+def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str = "XYZ"):
+    c = torch.cos(euler_angles)
+    s = torch.sin(euler_angles)
+
+    N = euler_angles.shape[0]
+    device = euler_angles.device
+    I = torch.eye(3, device=device).unsqueeze(0).repeat(N, 1, 1)
+
+    Rx = I.clone()
+    Rx[:, 1, 1] = c[:, 0];
+    Rx[:, 1, 2] = -s[:, 0]
+    Rx[:, 2, 1] = s[:, 0];
+    Rx[:, 2, 2] = c[:, 0]
+
+    Ry = I.clone()
+    Ry[:, 0, 0] = c[:, 1];
+    Ry[:, 0, 2] = s[:, 1]
+    Ry[:, 2, 0] = -s[:, 1];
+    Ry[:, 2, 2] = c[:, 1]
+
+    Rz = I.clone()
+    Rz[:, 0, 0] = c[:, 2];
+    Rz[:, 0, 1] = -s[:, 2]
+    Rz[:, 1, 0] = s[:, 2];
+    Rz[:, 1, 1] = c[:, 2]
+
+    R = torch.bmm(Rx, torch.bmm(Ry, Rz))
+    return R
+
+
+# ==========================================
+# 1. 设置超参数与设备 (Windows 适配)
+# ==========================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using compute device: {device}")
+
+num_views = 50
+num_points = 20000
+image_size = 1024
+cx, cy = image_size / 2, image_size / 2
+num_iterations = 2000
+
+# ==========================================
+# 2. 加载数据集
+# ==========================================
+print("Loading data...")
+if not os.path.exists('data/points2d.npz'):
+    raise FileNotFoundError("找不到 data/points2d.npz，请检查文件路径！")
+
+points2d_data = np.load('data/points2d.npz')
+colors = np.load('data/points3d_colors.npy')
+
+points2d_gt_list = []
+mask_list = []
+
+for i in range(num_views):
+    view_key = f"view_{i:03d}"
+    view_data = points2d_data[view_key]
+    points2d_gt_list.append(view_data[:, :2])
+    mask_list.append(view_data[:, 2])
+
+points2d_gt = torch.tensor(np.stack(points2d_gt_list), dtype=torch.float32, device=device)
+mask = torch.tensor(np.stack(mask_list), dtype=torch.bool, device=device)
+
+# ==========================================
+# 3. 初始化需要优化的参数
+# ==========================================
+f = nn.Parameter(torch.tensor(886.0, dtype=torch.float32, device=device))
+euler_angles = nn.Parameter(torch.zeros((num_views, 3), dtype=torch.float32, device=device))
+T_init = torch.tensor([[0.0, 0.0, -2.5]], dtype=torch.float32, device=device).repeat(num_views, 1)
+T = nn.Parameter(T_init)
+P3D = nn.Parameter(torch.randn((num_points, 3), dtype=torch.float32, device=device) * 0.1)
+
+# ==========================================
+# 4. 定义优化器
+# ==========================================
+optimizer = torch.optim.Adam([
+    {'params': [P3D], 'lr': 0.01},
+    {'params': [euler_angles, T], 'lr': 0.005},
+    {'params': [f], 'lr': 1.0}
+])
+
+loss_history = []
+
+# ==========================================
+# 5. 开始梯度下降优化 (Bundle Adjustment)
+# ==========================================
+print("Starting Bundle Adjustment Optimization...")
+for step in range(num_iterations):
+    optimizer.zero_grad()
+    R = euler_angles_to_matrix(euler_angles, convention="XYZ")
+    P_cam = torch.einsum('vij,nj->vni', R, P3D) + T.unsqueeze(1)
+
+    Xc, Yc, Zc = P_cam[..., 0], P_cam[..., 1], P_cam[..., 2]
+    eps = 1e-6
+    u_pred = -f * (Xc / (Zc - eps)) + cx
+    v_pred = f * (Yc / (Zc - eps)) + cy
+
+    P2D_pred = torch.stack([u_pred, v_pred], dim=-1)
+    diff = P2D_pred[mask] - points2d_gt[mask]
+    loss = (diff ** 2).mean()
+
+    loss.backward()
+    optimizer.step()
+    loss_history.append(loss.item())
+
+    if step % 100 == 0:
+        print(f"Iteration {step:04d} | Loss: {loss.item():.4f} | f: {f.item():.2f}")
+
+# ==========================================
+# 6. 保存与验证
+# ==========================================
+print("\nOptimization Finished! Saving results...")
+P3D_np = P3D.detach().cpu().numpy()
+with open("reconstructed_head.obj", "w") as f_out:
+    for i in range(num_points):
+        x, y, z = P3D_np[i]
+        r, g, b = colors[i]
+        f_out.write(f"v {x:.6f} {y:.6f} {z:.6f} {r:.4f} {g:.4f} {b:.4f}\n")
+
+print("Task 1 Complete! Saved to 'reconstructed_head.obj'.")
