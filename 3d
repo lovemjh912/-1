@@ -1,0 +1,48 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+
+# 改为 Windows 自带的 Tkinter 弹窗后端，确保能用鼠标拖拽旋转 3D 图像
+matplotlib.use('TkAgg')
+
+print("正在读取 3D 点云数据...")
+points = []
+colors = []
+
+# 读取生成的 obj 文件
+with open('reconstructed_head.obj', 'r') as f:
+    for line in f:
+        if line.startswith('v '):
+            parts = line.split()
+            points.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            colors.append([float(parts[4]), float(parts[5]), float(parts[6])])
+
+points = np.array(points)
+colors = np.array(colors)
+
+print("正在渲染 3D 图像...")
+fig = plt.figure(figsize=(10, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+X = points[:, 0]
+Y = points[:, 1]
+Z = points[:, 2]
+
+# 翻转坐标系，将数据的 Y(上)传给画板的 Z，数据的 Z(前)传给画板的 Y
+ax.scatter(X, -Z, Y, c=colors, s=1.5, alpha=1.0)
+
+# 调整视角，匹配老师的右前侧面观察
+ax.view_init(elev=10, azim=-60)
+
+# 设置纯白背景，关掉坐标轴
+ax.set_facecolor('white')
+ax.axis('off')
+ax.set_title("Expected result (reconstructed 3D point cloud)", fontsize=14, fontweight='bold', pad=20)
+
+# 保持各个轴的比例一致，防止人头变形
+try:
+    ax.set_box_aspect([np.ptp(X), np.ptp(Z), np.ptp(Y)])
+except:
+    pass
+
+plt.show()
